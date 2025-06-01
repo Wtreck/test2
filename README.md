@@ -1,12 +1,13 @@
-Hier eine maximal kompakte Lösung, die wirklich nur „alle Dokumente löschen“ macht. Wir zählen o. Ä. nicht, sondern rufen direkt vectorStore.delete(...) auf und liefern nur eine einfache Bestätigung zurück.
+Hier eine ultrakompakte Anpassung, bei der wir statt Filter.builder() den richtigen DSL‐Builder FilterExpressionBuilder verwenden. Damit funktioniert in Spring AI 1.0.0 Final das Löschen aller Dokumente ohne IDE-Fehler:
 
 ⸻
 
-1. Service-Klasse (sehr kurz)
+1. Service-Klasse: DeletionService.java
 
 package com.example.embedding.service;
 
 import org.springframework.ai.vectorstore.VectorStore;
+import org.springframework.ai.vectorstore.filter.FilterExpressionBuilder;
 import org.springframework.ai.vectorstore.filter.Filter;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -22,21 +23,28 @@ public class DeletionService {
 
     /**
      * Löscht alle Dokumente in der konfigurierten Weaviate-Klasse,
-     * indem einfach eine leere Filter-Expression übergeben wird.
+     * indem eine leere Filter.Expression erzeugt wird.
+     * Spring AI übersetzt das zu einer GraphQL-Mutation ohne WHERE-Klausel.
      */
     @Transactional
     public void deleteAll() {
-        vectorStore.delete(Filter.builder().build());
+        // 1. FilterExpressionBuilder erzeugen (ohne Bedingungen)
+        FilterExpressionBuilder builder = new FilterExpressionBuilder();
+        Filter.Expression emptyFilter = builder.build();
+
+        // 2. Löschen aller Objekte in der Weaviate-Klasse
+        vectorStore.delete(emptyFilter);
     }
 }
 
-Erläuterung:
-	•	Filter.builder().build() erzeugt exakt eine leere Filter-Expression.
-	•	Spring AI übersetzt das in eine Weaviate-Mutation ohne WHERE-Klausel, wodurch wirklich alle Objekte in der angegebenen Klasse gelöscht werden.
+Wichtig:
+	•	Wir erstellen eine leere Filter.Expression via new FilterExpressionBuilder().build().
+	•	Spring AI übersetzt das intern in eine Weaviate-Mutation ohne WHERE, was wirklich alle Objekte der in application.properties konfigurierten object-class entfernt.
+	•	@Transactional sorgt nur dafür, dass bei einem Fehler eine Exception nach oben geht (Weaviate selbst kennt keine DB-Transaktion).
 
 ⸻
 
-2. Controller-Klasse (ultrakurz)
+2. Controller-Klasse: EmbeddingController.java
 
 package com.example.embedding.controller;
 
@@ -58,7 +66,8 @@ public class EmbeddingController {
 
     /**
      * POST /embedding/delete-all
-     * Löscht einfach alle Einträge. Liefert { "message": "Deleted" } zurück.
+     * Löscht alle Einträge im Weaviate-VectorStore und gibt
+     * einfach { "message": "Deleted" } zurück.
      */
     @PostMapping("/delete-all")
     public ResponseEntity<Map<String, String>> deleteAll() {
@@ -67,29 +76,27 @@ public class EmbeddingController {
     }
 }
 
-Erläuterung:
-	•	POST /embedding/delete-all ruft nur deletionService.deleteAll() auf.
-	•	Anschließend geben wir ein minimales JSON mit message zurück und Status 200.
+Hinweis:
+	•	Deine React-Komponente macht einen POST auf /embedding/delete-all.
+	•	Wir geben nur das Feld "message" als JSON zurück, damit im Frontend data.message gelesen werden kann.
 
 ⸻
 
-3. Anwendungskonfiguration (unverändert, nur zur Erinnerung)
-
-In src/main/resources/application.properties braucht es weiterhin:
+3. application.properties (zur Erinnerung)
 
 spring.ai.vectorstore.weaviate.endpoint-url=https://my-weaviate.example.com/v1
 spring.ai.vectorstore.weaviate.api-key=${WEAVIATE_API_KEY}
 spring.ai.vectorstore.weaviate.object-class=MeineDokumente
 spring.ai.vectorstore.weaviate.filter-metadata-fields=foo
 
-	•	object-class muss der Name deiner Weaviate-Klasse sein.
-	•	filter-metadata-fields darf ruhig nur ein einziges Dummy-Feld (z. B. foo) enthalten, damit ein leerer Filter intern funktioniert.
+	•	object-class: Der Name deiner Weaviate-Klasse.
+	•	filter-metadata-fields: Mindestens ein (Dummy-)Feld, damit ein leerer Filter überhaupt validiert wird.
 
 ⸻
 
 4. Anpassung in der React-Komponente
 
-Da Du jetzt vom Backend einfach nur { message: "…" } zurücklieferst, genügt ein Minimum an Änderungen in deiner Component. So kann sie bleiben:
+Da wir jetzt nur noch { message: "Alle Einträge wurden gelöscht." } zurückgeben, genügt dieser Code (deine Komponente bleibt nahezu unverändert):
 
 import React, { useState, useContext } from 'react';
 import { Headline, Paragraph, Button } from '@lsg/components';
@@ -122,7 +129,7 @@ export const Deletion: React.FC = () => {
                 );
             }
             const data = await response.json();
-            // Wir lesen einfach nur "message" aus dem JSON
+            // Nur "message" wird erwartet
             setResult(data.message || t('DELETE_EMBEDDINGS.MSG_DELETE_ALL_SUCCESS'));
         } catch (error: any) {
             errorContext.setErrorInfo(
@@ -159,16 +166,13 @@ export const Deletion: React.FC = () => {
     );
 };
 
-Wichtig:
-	•	Wir erwarten nur noch eine Zeichenkette unter data.message.
-	•	Ein deletedCount wird nicht mehr benötigt, daher entfällt die Logik dazu.
-	•	In Deinen i18n-Dateien solltest du nur DELETE_EMBEDDINGS.MSG_DELETE_ALL_SUCCESS als Fallback definieren, falls data.message leer ist.
+Achte darauf, dass in deinen i18n-Dateien nur noch DELETE_EMBEDDINGS.MSG_DELETE_ALL_SUCCESS (als Fallback) existiert, falls data.message leer sein sollte.
 
 ⸻
 
-5. Zusammenfassung
-	•	Service: Eine Einzeiler-Methode vectorStore.delete(Filter.builder().build()), um alles zu löschen.
-	•	Controller: Ein Einzeiler, der deleteAll() aufruft und {"message":"…"} zurückgibt.
-	•	React: Liest nur noch data.message und zeigt es an.
+Zusammenfassung
+	1.	Service: Nutzt new FilterExpressionBuilder().build(), um eine leere Filter.Expression zu erzeugen, und ruft vectorStore.delete(emptyFilter) auf.
+	2.	Controller: Bietet POST /embedding/delete-all an, ruft deletionService.deleteAll() und gibt { message: "Alle Einträge wurden gelöscht." } zurück.
+	3.	Front-end: fetch('/embedding/delete-all', { method: 'POST' }) liest nur noch data.message.
 
-So bleibt der gesamte Löschen-Flow maximal schlank und erfüllt genau deine Anforderung: alle Dokumente löschen – mehr ist nicht nötig.
+Damit ist der gesamte Lösch-Flow maximal schlank und du vermeidest den Fehler „Can’t resolve method builder in Filter“.
