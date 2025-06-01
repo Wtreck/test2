@@ -1,6 +1,1 @@
-spring:
-  ai:
-    vectorstore:
-      weaviate:
-        host: frame-docs-store.entw.apps.cloud.internal
-        filter-metadata-fields: path,charset,source,creation_timestamp
+Cannot resolve configuration property 'spring.ai.vectorstore.weaviate.filter-metadata-fields' 
