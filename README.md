@@ -1,14 +1,27 @@
-Hier eine ultrakompakte Anpassung, bei der wir statt Filter.builder() den richtigen DSL‐Builder FilterExpressionBuilder verwenden. Damit funktioniert in Spring AI 1.0.0 Final das Löschen aller Dokumente ohne IDE-Fehler:
+Um wirklich alle Dokumente ohne Builder‐Klasse zu löschen, kannst du statt FilterExpressionBuilder einfach die String‐Variante von delete(...) verwenden. Wenn in jedem Dokument ein bestimmtes Metadatenfeld (z. B. foo) existiert und du dieses Feld in deinen application.properties unter filter-metadata-fields registriert hast, löscht der Ausdruck "foo != ''" alle Einträge. Das ist noch kompakter:
 
 ⸻
 
-1. Service-Klasse: DeletionService.java
+1. application.properties
+
+Stelle sicher, dass du mindestens folgendes gesetzt hast:
+
+spring.ai.vectorstore.weaviate.endpoint-url=https://my-weaviate.example.com/v1
+spring.ai.vectorstore.weaviate.api-key=${WEAVIATE_API_KEY}
+spring.ai.vectorstore.weaviate.object-class=MeineDokumente
+
+# <– Hier das Metadatenfeld „foo“ so angeben, dass es in jedem Dokument vorhanden ist.
+spring.ai.vectorstore.weaviate.filter-metadata-fields=foo
+
+Tipp: Wenn jedes Dokument unter "foo" einen (nicht‐leeren) Wert hat, trifft der Filter "foo != ''" auf alle Dokumente zu.
+
+⸻
+
+2. Service‐Klasse (ultrakompakt)
 
 package com.example.embedding.service;
 
 import org.springframework.ai.vectorstore.VectorStore;
-import org.springframework.ai.vectorstore.filter.FilterExpressionBuilder;
-import org.springframework.ai.vectorstore.filter.Filter;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -22,29 +35,23 @@ public class DeletionService {
     }
 
     /**
-     * Löscht alle Dokumente in der konfigurierten Weaviate-Klasse,
-     * indem eine leere Filter.Expression erzeugt wird.
-     * Spring AI übersetzt das zu einer GraphQL-Mutation ohne WHERE-Klausel.
+     * Löscht alle Dokumente, indem wir per String‐Filter auf das Metadatenfeld "foo"
+     * prüfen, das in jedem Dokument existiert. "foo != ''" trifft daher auf alle Einträge zu.
      */
     @Transactional
     public void deleteAll() {
-        // 1. FilterExpressionBuilder erzeugen (ohne Bedingungen)
-        FilterExpressionBuilder builder = new FilterExpressionBuilder();
-        Filter.Expression emptyFilter = builder.build();
-
-        // 2. Löschen aller Objekte in der Weaviate-Klasse
-        vectorStore.delete(emptyFilter);
+        vectorStore.delete("foo != ''");
     }
 }
 
-Wichtig:
-	•	Wir erstellen eine leere Filter.Expression via new FilterExpressionBuilder().build().
-	•	Spring AI übersetzt das intern in eine Weaviate-Mutation ohne WHERE, was wirklich alle Objekte der in application.properties konfigurierten object-class entfernt.
-	•	@Transactional sorgt nur dafür, dass bei einem Fehler eine Exception nach oben geht (Weaviate selbst kennt keine DB-Transaktion).
+Warum das funktioniert:
+	•	vectorStore.delete(String) wandelt den String intern in eine Filter.Expression um.
+	•	Mit "foo != ''" forderst du: Lösche alle Dokumente, bei denen das Feld foo nicht leer ist.
+	•	Da du in application.properties angegeben hast, dass foo in jedem Dokument vorhanden ist, löscht dieser Filter wirklich alles.
 
 ⸻
 
-2. Controller-Klasse: EmbeddingController.java
+3. Controller‐Klasse (ebenfalls kompakt)
 
 package com.example.embedding.controller;
 
@@ -66,8 +73,8 @@ public class EmbeddingController {
 
     /**
      * POST /embedding/delete-all
-     * Löscht alle Einträge im Weaviate-VectorStore und gibt
-     * einfach { "message": "Deleted" } zurück.
+     * Einfacher Endpunkt, der alle Dokumente löscht.
+     * Liefert JSON { "message": "Alle Einträge wurden gelöscht." } zurück.
      */
     @PostMapping("/delete-all")
     public ResponseEntity<Map<String, String>> deleteAll() {
@@ -76,27 +83,16 @@ public class EmbeddingController {
     }
 }
 
-Hinweis:
-	•	Deine React-Komponente macht einen POST auf /embedding/delete-all.
-	•	Wir geben nur das Feld "message" als JSON zurück, damit im Frontend data.message gelesen werden kann.
+Erklärung:
+	•	Die React‐Komponente macht einen POST auf /embedding/delete-all.
+	•	Der Service führt direkt vectorStore.delete("foo != ''") aus, was alle Dokumente löscht.
+	•	Anschließend liefert der Controller nur noch { "message": "Alle Einträge wurden gelöscht." } mit HTTP 200.
 
 ⸻
 
-3. application.properties (zur Erinnerung)
+4. React‐Komponente (bleibt unverändert)
 
-spring.ai.vectorstore.weaviate.endpoint-url=https://my-weaviate.example.com/v1
-spring.ai.vectorstore.weaviate.api-key=${WEAVIATE_API_KEY}
-spring.ai.vectorstore.weaviate.object-class=MeineDokumente
-spring.ai.vectorstore.weaviate.filter-metadata-fields=foo
-
-	•	object-class: Der Name deiner Weaviate-Klasse.
-	•	filter-metadata-fields: Mindestens ein (Dummy-)Feld, damit ein leerer Filter überhaupt validiert wird.
-
-⸻
-
-4. Anpassung in der React-Komponente
-
-Da wir jetzt nur noch { message: "Alle Einträge wurden gelöscht." } zurückgeben, genügt dieser Code (deine Komponente bleibt nahezu unverändert):
+Deine Deletion‐Komponente kann wie bisher bleiben, weil wir nur das JSON‐Feld message zurückliefern:
 
 import React, { useState, useContext } from 'react';
 import { Headline, Paragraph, Button } from '@lsg/components';
@@ -122,6 +118,7 @@ export const Deletion: React.FC = () => {
             });
 
             if (!response.ok) {
+                // Falls Fehler kommen, erwartet dein Code JSON mit { error, trace }
                 const err = await response.json();
                 throw Object.assign(
                     new Error(err.error || `HTTP ${response.status}`),
@@ -129,7 +126,7 @@ export const Deletion: React.FC = () => {
                 );
             }
             const data = await response.json();
-            // Nur "message" wird erwartet
+            // Nur 'message' wird erwartet
             setResult(data.message || t('DELETE_EMBEDDINGS.MSG_DELETE_ALL_SUCCESS'));
         } catch (error: any) {
             errorContext.setErrorInfo(
@@ -166,13 +163,21 @@ export const Deletion: React.FC = () => {
     );
 };
 
-Achte darauf, dass in deinen i18n-Dateien nur noch DELETE_EMBEDDINGS.MSG_DELETE_ALL_SUCCESS (als Fallback) existiert, falls data.message leer sein sollte.
+Wichtig:
+	•	In deiner Übersetzungsdatei (de.json) brauchst du mindestens einen Fallback‐Key wie
+
+"DELETE_EMBEDDINGS": {
+  "MSG_DELETE_ALL_SUCCESS": "Alle Einträge wurden gelöscht."
+}
+
+falls data.message mal fehlen sollte.
 
 ⸻
 
-Zusammenfassung
-	1.	Service: Nutzt new FilterExpressionBuilder().build(), um eine leere Filter.Expression zu erzeugen, und ruft vectorStore.delete(emptyFilter) auf.
-	2.	Controller: Bietet POST /embedding/delete-all an, ruft deletionService.deleteAll() und gibt { message: "Alle Einträge wurden gelöscht." } zurück.
-	3.	Front-end: fetch('/embedding/delete-all', { method: 'POST' }) liest nur noch data.message.
+5. Fazit
+	•	Keine Builder-Klasse mehr nötig: Statt FilterExpressionBuilder nutzt du einfach vectorStore.delete("foo != ''").
+	•	Maximal kurz: Service und Controller bestehen nur noch aus je einer Methode.
+	•	Sicherstellen: In application.properties “filter-metadata-fields=foo” setzen, und in jedem Dokument unter foo einen nicht-leeren Wert speichern.
+	•	Voll funktional: Auf Klick löscht das Backend alles aus deinem Weaviate-Index, und die React-Komponente zeigt die Erfolgsmeldung an.
 
-Damit ist der gesamte Lösch-Flow maximal schlank und du vermeidest den Fehler „Can’t resolve method builder in Filter“.
+So bleibt dein Lösch-Flow wirklich einfach und kompakt, ohne weitere Builder- oder Aggregate-Schritte.
