@@ -1,183 +1,156 @@
-Um wirklich alle Dokumente ohne Builder‐Klasse zu löschen, kannst du statt FilterExpressionBuilder einfach die String‐Variante von delete(...) verwenden. Wenn in jedem Dokument ein bestimmtes Metadatenfeld (z. B. foo) existiert und du dieses Feld in deinen application.properties unter filter-metadata-fields registriert hast, löscht der Ausdruck "foo != ''" alle Einträge. Das ist noch kompakter:
+spring:
+  ai:
+    # (CoBa) Azure OpenAI configuration
+    # ===============================
+    azure:
+      openai:
+        endpoint: "https://api-int-dev.intranet.commerzbank.com:8065/utilities-api/azure-openai/v1"
+        chat:
+          options:
+            deployment-name: "gpt4o20240806"
+            max-tokens: 2000
+            temperature: 0.7
+            top-p: 0.95
+        embedding:
+          options:
+            deployment-name: "teada0022"
+    vectorstore:
+      weaviate:
+        host: frame-docs-store.entw.apps.cloud.internal
+  security:
+    oauth2:
+      # oauth2 client configuration to access CoBa Azure OpenAI API (internal LLM Services API)
 
-⸻
+frame:
+  ai:
+    # FRAME (CoBa) Azure OpenAI configuration
+    # ===============================
+    azure:
+      openai:
+        service-version: V2024_06_01
+        max-retries: 5
+        base-delay: 100
+        max-delay: 1000
+        http-client:
+          connect-timeout: 250
+          call-timeout: 10
 
-1. application.properties
 
-Stelle sicher, dass du mindestens folgendes gesetzt hast:
+   package com.commerzbank.frame.ai.etl.business.service;
 
-spring.ai.vectorstore.weaviate.endpoint-url=https://my-weaviate.example.com/v1
-spring.ai.vectorstore.weaviate.api-key=${WEAVIATE_API_KEY}
-spring.ai.vectorstore.weaviate.object-class=MeineDokumente
-
-# <– Hier das Metadatenfeld „foo“ so angeben, dass es in jedem Dokument vorhanden ist.
-spring.ai.vectorstore.weaviate.filter-metadata-fields=foo
-
-Tipp: Wenn jedes Dokument unter "foo" einen (nicht‐leeren) Wert hat, trifft der Filter "foo != ''" auf alle Dokumente zu.
-
-⸻
-
-2. Service‐Klasse (ultrakompakt)
-
-package com.example.embedding.service;
-
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.ai.document.Document;
+import org.springframework.ai.reader.TextReader;
+import org.springframework.ai.transformer.splitter.TextSplitter;
+import org.springframework.ai.transformer.splitter.TokenTextSplitter;
 import org.springframework.ai.vectorstore.VectorStore;
+import org.springframework.core.io.PathResource;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
 
+import java.nio.file.Path;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
+
+/**
+ * Service creating and maintaining the embeddings for the Markdown documents comprising FRAME's
+ * documentation, excluding images, PDFs, and other media.
+ * <p>
+ * As the Markdown files' source is the FRAME documentation Git repository, this service uses a
+ * {@link GitRepoAccessor} to clone the repository and read the Markdown files, before Extracting,
+ * Transforming, and Loading the documents into the vector store using an ETL pipeline.
+ *
+ * @author cb2ro7y - Leon Rosche
+ * @author cb2strc - Silvana Sadewasser
+ */
 @Service
-public class DeletionService {
+public class EmbeddingsService {
+	/** Logger. */
+	private static final Logger LOG = LoggerFactory.getLogger(EmbeddingsService.class);
 
-    private final VectorStore vectorStore;
+	/** The accessor to the Git repository containing the FRAME documentation. */
+	private final GitRepoAccessor gitRepoAccessor;
 
-    public DeletionService(VectorStore vectorStore) {
-        this.vectorStore = vectorStore;
-    }
+	/** The vector store where the embedded documents are stored. */
+	private final VectorStore store;
 
-    /**
-     * Löscht alle Dokumente, indem wir per String‐Filter auf das Metadatenfeld "foo"
-     * prüfen, das in jedem Dokument existiert. "foo != ''" trifft daher auf alle Einträge zu.
-     */
-    @Transactional
-    public void deleteAll() {
-        vectorStore.delete("foo != ''");
-    }
+	/**
+	 * The document transformer for splitting the {@link Document}s into appropriate chunks for
+	 * embedding.
+	 * <p>
+	 * The splitter is parameterized especially for this sample use case, i.e. for the embedding of
+	 * FRAME's Markdown documents. In other use cases, the parameters are likely to be different
+	 * and should be adjusted accordingly.
+	 */
+	private final TextSplitter splitter = new TokenTextSplitter(6000, 50, 50, 10000, true);
+
+	public EmbeddingsService(VectorStore store, GitRepoAccessor gitRepoAccessor) {
+		this.store = store;
+		this.gitRepoAccessor = gitRepoAccessor;
+	}
+
+	/**
+	 * Embeds the FRAME documentation's Markdown documents into the associated vector store.
+	 * <p>
+	 * The Markdown files are cloned from the FRAME documentation repository to a directory. Then,
+	 * they are read from this clone directory, parsed into {@link Document}s, and split into
+	 * smaller chunks. Each chunk resp. new document is enriched with metadata, i.e. the path to
+	 * the Markdown file and the creation timestamp of the document, before being loaded into the
+	 * vector store.
+	 */
+	public void embed() {
+		gitRepoAccessor.deleteCloneDir();
+		gitRepoAccessor.cloneRepository();
+
+		final var documents = new ArrayList<Document>();
+		for (var markdown : gitRepoAccessor.loadFiles()) {
+			final var chunks = transform(extract(markdown));
+			documents.addAll(chunks);
+		}
+		store.accept(documents);
+		LOG.info("Loaded in total {} chunked documents into vector store", documents.size());
+	}
+
+	/**
+	 * Extracts a {@link Document} from the given Markdown file of the FRAME documentation using an
+	 * instance of {@link TextReader} instead of Spring AI's 'MarkdownDocumentReader', to ensure
+	 * that the document is split into appropriate chunks for embedding. It adds the relative path
+	 * to the Markdown file as metadata to the document and thus to all chunks created from it.
+	 *
+	 * @param markdown The path to the Markdown source file to be processed.
+	 * @return The extracted {@link Document} with metadata.
+	 */
+	private Document extract(Path markdown) {
+		final var reader = new TextReader(new PathResource(markdown));
+		reader.getCustomMetadata().put("path",
+			gitRepoAccessor.getRootDir().relativize(markdown).toString());
+		final var document = reader.read().get(0);
+		LOG.info("Extracted document with meta data '{}' from file '{}'", document.getMetadata(),
+			markdown);
+		return document;
+	}
+
+	/**
+	 * Transforms the given {@link Document} into smaller chunks using the {@link TokenTextSplitter}
+	 * and adds the chunk's creation timestamp as metadata to each chunk.
+	 *
+	 * @param document The original {@link Document} to be transformed into suitable chunks for
+	 *                 embedding.
+	 * @return A list of transformed {@link Document}s, each representing a chunk of the original
+	 * document.
+	 */
+	private List<Document> transform(Document document) {
+		var chunks = new ArrayList<Document>();
+		var chunkCount = 0;
+		for (var chunk : splitter.split(document)) {
+			chunk.getMetadata().put("creation_timestamp", Instant.now().toEpochMilli());
+			LOG.debug("Created chunk with meta data '{}'", chunk.getMetadata());
+			chunks.add(chunk);
+			chunkCount++;
+		}
+		LOG.info("Transformed document with meta data '{}' into {} chunks", document.getMetadata(),
+			chunkCount);
+		return chunks;
+	}
 }
-
-Warum das funktioniert:
-	•	vectorStore.delete(String) wandelt den String intern in eine Filter.Expression um.
-	•	Mit "foo != ''" forderst du: Lösche alle Dokumente, bei denen das Feld foo nicht leer ist.
-	•	Da du in application.properties angegeben hast, dass foo in jedem Dokument vorhanden ist, löscht dieser Filter wirklich alles.
-
-⸻
-
-3. Controller‐Klasse (ebenfalls kompakt)
-
-package com.example.embedding.controller;
-
-import com.example.embedding.service.DeletionService;
-import org.springframework.http.ResponseEntity;
-import org.springframework.web.bind.annotation.*;
-
-import java.util.Map;
-
-@RestController
-@RequestMapping("/embedding")
-public class EmbeddingController {
-
-    private final DeletionService deletionService;
-
-    public EmbeddingController(DeletionService deletionService) {
-        this.deletionService = deletionService;
-    }
-
-    /**
-     * POST /embedding/delete-all
-     * Einfacher Endpunkt, der alle Dokumente löscht.
-     * Liefert JSON { "message": "Alle Einträge wurden gelöscht." } zurück.
-     */
-    @PostMapping("/delete-all")
-    public ResponseEntity<Map<String, String>> deleteAll() {
-        deletionService.deleteAll();
-        return ResponseEntity.ok(Map.of("message", "Alle Einträge wurden gelöscht."));
-    }
-}
-
-Erklärung:
-	•	Die React‐Komponente macht einen POST auf /embedding/delete-all.
-	•	Der Service führt direkt vectorStore.delete("foo != ''") aus, was alle Dokumente löscht.
-	•	Anschließend liefert der Controller nur noch { "message": "Alle Einträge wurden gelöscht." } mit HTTP 200.
-
-⸻
-
-4. React‐Komponente (bleibt unverändert)
-
-Deine Deletion‐Komponente kann wie bisher bleiben, weil wir nur das JSON‐Feld message zurückliefern:
-
-import React, { useState, useContext } from 'react';
-import { Headline, Paragraph, Button } from '@lsg/components';
-import { routeStrategy } from '../../shared/app-routing';
-import { ErrorContext } from '../../context/error.context.provider';
-import ErrorMessage from '../../service/error.message';
-import { useTranslation } from 'react-i18next';
-
-export const Deletion: React.FC = () => {
-    const { t } = useTranslation();
-    const errorContext = useContext(ErrorContext);
-    const [loading, setLoading] = useState<boolean>(false);
-    const [result, setResult] = useState<string>('');
-
-    const handleDeleteAll = async () => {
-        setLoading(true);
-        setResult('');
-        try {
-            const route = await routeStrategy();
-            const response = await fetch(route.api('/embedding/delete-all'), {
-                method: 'POST',
-                credentials: 'include'
-            });
-
-            if (!response.ok) {
-                // Falls Fehler kommen, erwartet dein Code JSON mit { error, trace }
-                const err = await response.json();
-                throw Object.assign(
-                    new Error(err.error || `HTTP ${response.status}`),
-                    { status: response.status, trace: err.trace }
-                );
-            }
-            const data = await response.json();
-            // Nur 'message' wird erwartet
-            setResult(data.message || t('DELETE_EMBEDDINGS.MSG_DELETE_ALL_SUCCESS'));
-        } catch (error: any) {
-            errorContext.setErrorInfo(
-                new ErrorMessage(
-                    error.status?.toString() || '500',
-                    error.message,
-                    error.trace || ''
-                )
-            );
-        } finally {
-            setLoading(false);
-        }
-    };
-
-    return (
-        <div className="embedded-model-delete">
-            <Headline size="h4" as="h3">
-                {t('DELETE_EMBEDDINGS.TITLE')}
-            </Headline>
-            <Paragraph>{t('DELETE_EMBEDDINGS.DESCRIPTION')}</Paragraph>
-            <div className="button-container">
-                <Button
-                    label={loading ? t('DELETE_EMBEDDINGS.BUTTON_LOADING') : t('DELETE_EMBEDDINGS.BUTTON_DELETE_ALL')}
-                    onClick={handleDeleteAll}
-                    disabled={loading}
-                />
-            </div>
-            {result && (
-                <div className="result-container">
-                    <Paragraph>{result}</Paragraph>
-                </div>
-            )}
-        </div>
-    );
-};
-
-Wichtig:
-	•	In deiner Übersetzungsdatei (de.json) brauchst du mindestens einen Fallback‐Key wie
-
-"DELETE_EMBEDDINGS": {
-  "MSG_DELETE_ALL_SUCCESS": "Alle Einträge wurden gelöscht."
-}
-
-falls data.message mal fehlen sollte.
-
-⸻
-
-5. Fazit
-	•	Keine Builder-Klasse mehr nötig: Statt FilterExpressionBuilder nutzt du einfach vectorStore.delete("foo != ''").
-	•	Maximal kurz: Service und Controller bestehen nur noch aus je einer Methode.
-	•	Sicherstellen: In application.properties “filter-metadata-fields=foo” setzen, und in jedem Dokument unter foo einen nicht-leeren Wert speichern.
-	•	Voll funktional: Auf Klick löscht das Backend alles aus deinem Weaviate-Index, und die React-Komponente zeigt die Erfolgsmeldung an.
-
-So bleibt dein Lösch-Flow wirklich einfach und kompakt, ohne weitere Builder- oder Aggregate-Schritte.
